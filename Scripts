@@ -96,6 +96,7 @@ loaded_ts = now()
 ;
 
 #Инкрементная загрузка
+
 ##1. Маркер последнего обработанного значения
 ###Flights:
 create table if not exists kdz_begeba_etl.srctostag_lastprocessedvaluets(
@@ -213,3 +214,67 @@ vv_horizontal_visibility = excluded.vv_horizontal_visibility,
 td_dewpoint_temperature = excluded.td_dewpoint_temperature,
 loaded_ts = now()
 ;
+
+#Код для etl-процедур stagind-to-dds
+
+#Полня загрузка:
+
+drop table if exists kdz_begeba_etl.flights_hnl_ready;
+create table kdz_begeba_etl.flights_hnl_cancelled_ready as
+select distinct
+"year",
+quarter,
+"month",
+to_timestamp(concat(to_char(flight_date, 'MM.DD.YY'), ' ', crs_dep_time), 'MM.DD.YY HH.MI') as flight_dep_scheduled,
+flight_date as flight_scheduled_date,
+to_timestamp(concat(to_char(flight_date, 'MM.DD.YY'), ' ', crs_dep_time), 'MM.DD.YY HH:MI') + dep_delay_minutes * INTERVAL '1 minute' as flight_dep_actual,
+to_date(to_char(to_timestamp(concat(to_char(flight_date, 'MM.DD.YY'), ' ', crs_dep_time), 'MM.DD.YY HH:MI') + dep_delay_minutes * INTERVAL '1 minute', 'MM.DD.YY'), 'MM.DD.YY') as flight_actual_date,
+reporting_airline,
+tail_number,
+flight_number,
+origin,
+as origin_dk,
+destination,
+as destination_dk
+crs_dep_time,
+dep_time,
+dep_delay_minutes,
+cancelled,
+cancellation_code,
+air_time,
+distance,
+weather_delay
+from kdz_begeba_staging.hnl_flights_staging
+WHERE origin = 'HNL' AND cancelled = '1.00' or origin = 'HNL' and dep_delay_minutes > 0;
+
+drop table if exists kdz_begeba_etl.flights_hnl_ready;
+create table kdz_begeba_etl.flights_hnl_cancelled_ready as
+select distinct
+"year",
+quarter,
+"month",
+to_timestamp(concat(to_char(flight_date, 'MM.DD.YY'), ' ', crs_dep_time), 'MM.DD.YY HH.MI') as flight_dep_scheduled,
+flight_date as flight_scheduled_date,
+to_timestamp(concat(to_char(flight_date, 'MM.DD.YY'), ' ', crs_dep_time), 'MM.DD.YY HH:MI') + dep_delay_minutes * INTERVAL '1 minute' as flight_dep_actual,
+to_date(to_char(to_timestamp(concat(to_char(flight_date, 'MM.DD.YY'), ' ', crs_dep_time), 'MM.DD.YY HH:MI') + dep_delay_minutes * INTERVAL '1 minute', 'MM.DD.YY'), 'MM.DD.YY') as flight_actual_date,
+reporting_airline,
+tail_number,
+flight_number,
+origin,
+(select airport_dk 
+from dds.airport 
+WHERE iata_code = origin) as origin_dk,
+destination,
+(select airport_dk
+from dds.airport
+WHERE iata_code = destination) as destination_dk,
+crs_dep_time,
+dep_time,
+dep_delay_minutes,
+cancelled,
+cancellation_code,
+air_time,
+distance,
+weather_delay
+from kdz_begeba_staging.hnl_flights_staging
+WHERE origin = 'HNL' AND cancelled = '1.00' or origin = 'HNL' and dep_delay_minutes > 0;
