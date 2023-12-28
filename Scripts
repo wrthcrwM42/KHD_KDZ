@@ -1,0 +1,215 @@
+#Код для подключения к базе и установки сертификата:
+
+/psql "host= c-c9qia8aq371ibav26ned.rw.mdb.yandexcloud.net port=6432 sslmode=verify-full dbname=hse_main user=sa target_session_attrs=read-write"
+mkdir -p ~/.postgresql && \ wget "https://storage.yandexcloud.net/cloudcerts/CA.pem" \ --output-document ~/.postgresql/root.crt && \ chmod 0600 ~/.postgresql/root.crt
+
+#Код для etl-процедур src-to-staging
+
+#Полная загрузка:
+
+##1. Чтение сырых данных
+
+###Flights:
+drop table if exists kdz_begeba_etl.flightstempfull;
+create table kdz_begeba_etl.flightstempfull as
+select distinct
+"year",
+quarter,
+"month",
+to_date(to_char(to_date(flight_date, 'MM.DD.YYYY'), 'DD.MM.YYYY'), 'DD.MM.YYYY') as flight_date,
+reporting_airline,
+tail_number,
+flight_number,
+origin,
+destination,
+to_char(crs_dep_time::time, 'HH:MI')  as crs_dep_time,
+to_char(dep_time::time, 'HH:MI')  as dep_time,
+dep_delay_minutes,
+cancelled,
+cancellation_code,
+air_time,
+distance,
+weather_delay
+from kdz_begeba_src.hnl_flights_fixed;
+
+###Weather:
+drop table if exists kdz_begeba_etl.weathertempfull;
+create table kdz_begeba_etl.weathertempfull as
+select distinct
+icao_code,
+to_timestamp(local_time, 'DD.MM.YYYY HH24:MI:SS') as local_time,
+air_temperature,
+p0_station_pressure,
+p_sea_pressure,
+u_humidity,
+dd_wind_direction,
+ff_wind_speed,
+ff10_max_gust_speed,
+ww_present_phenomena,
+ww_recent_phenomena,
+c_total_cloud_cover,
+vv_horizontal_visibility,
+td_dewpoint_temperature
+from kdz_begeba_src.hnl_weather;
+
+##2. Запись в целевую таблицу staging
+
+###Flights:
+insert into kdz_begeba_staging.hnl_flights_staging( "year", quarter, "month", flight_date, reporting_airline, tail_number, flight_number, origin, destination, crs_dep_time, dep_time, dep_delay_minutes, cancelled, cancellation_code, air_time, distance, weather_delay)
+select "year", quarter, "month", flight_date, reporting_airline, tail_number, flight_number, origin, destination, crs_dep_time, dep_time, dep_delay_minutes, cancelled, cancellation_code, air_time, distance, weather_delay
+from kdz_begeba_etl.flightstempfull
+on conflict(flight_date, flight_number, origin, destination, crs_dep_time) do update
+set "year" = excluded."year",
+quarter = excluded.quarter,
+"month" = excluded."month",
+reporting_airline = excluded.reporting_airline,
+tail_number = excluded.tail_number,
+dep_time = excluded.dep_time,
+dep_delay_minutes = excluded.dep_delay_minutes,
+cancelled = excluded.cancelled,
+cancellation_code = excluded.cancellation_code,
+air_time = excluded.air_time,
+distance = excluded.distance,
+weather_delay = excluded.weather_delay,
+loaded_ts = now()
+;
+
+###Weather:
+insert into kdz_begeba_staging.hnl_weather_staging( icao_code, local_time, air_temperature, p0_station_pressure, p_sea_pressure, u_humidity, dd_wind_direction, ff_wind_speed, ff10_max_gust_speed, ww_present_phenomena, ww_recent_phenomena, c_total_cloud_cover, vv_horizontal_visibility, td_dewpoint_temperature)
+select icao_code, local_time, air_temperature, p0_station_pressure, p_sea_pressure, u_humidity, dd_wind_direction, ff_wind_speed, ff10_max_gust_speed, ww_present_phenomena, ww_recent_phenomena, c_total_cloud_cover, vv_horizontal_visibility, td_dewpoint_temperature
+from kdz_begeba_etl.weathertempfull
+on conflict(local_time) do update
+set air_temperature = excluded.air_temperature,
+icao_code = excluded.icao_code,
+p0_station_pressure = excluded.p0_station_pressure,
+p_sea_pressure = excluded.p_sea_pressure,
+u_humidity = excluded.u_humidity,
+dd_wind_direction = excluded.dd_wind_direction,
+ff_wind_speed = excluded.ff_wind_speed,
+ff10_max_gust_speed = excluded.ff10_max_gust_speed,
+ww_present_phenomena = excluded.ww_present_phenomena,
+ww_recent_phenomena = excluded.ww_recent_phenomena,
+c_total_cloud_cover = excluded.c_total_cloud_cover,
+vv_horizontal_visibility = excluded.vv_horizontal_visibility,
+td_dewpoint_temperature = excluded.td_dewpoint_temperature,
+loaded_ts = now()
+;
+
+#Инкрементная загрузка
+##1. Маркер последнего обработанного значения
+###Flights:
+create table if not exists kdz_begeba_etl.srctostag_lastprocessedvaluets(
+loaded_ts timestamp not null primary key
+);
+
+###Weather:
+create table if not exists kdz_begeba_etl.srctostag_lastprocessedvaluets_weather(
+loaded_ts timestamp not null primary key
+);
+
+##2. Определение самого "свежего" значения
+###Flights:
+drop table if exists kdz_begeba_etl.srctostag_comparets;
+create table if not exists kdz_begeba_etl.srctostag_comparets as
+select
+min(loaded_ts) as ts1,
+max(loaded_ts) as ts2
+from kdz_begeba_src.hnl_flights_fixed
+where loaded_ts >= coalesce((select max(loaded_ts) from kdz_begeba_etl.srctostag_lastprocessedvaluets), '1970-01-01');
+
+###Weather:
+drop table if exists kdz_begeba_etl.srctostag_comparets_weather;
+create table if not exists kdz_begeba_etl.srctostag_comparets_weather as
+select
+min(loaded_ts) as ts1,
+max(loaded_ts) as ts2
+from kdz_begeba_src.hnl_weather
+where loaded_ts >= coalesce((select max(loaded_ts) from kdz_begeba_etl.srctostag_lastprocessedvaluets_weather), '1970-01-01');
+
+##3. Чтение сырых данных, которые не были обработаны ранее
+###Flights:
+drop table if exists kdz_begeba_etl.srctostag_flightstemp;
+create table if not exists kdz_begeba_etl.srctostag_flightstemp as
+select distinct
+"year",
+quarter,
+"month",
+to_date(to_char(to_date(flight_date, 'MM.DD.YYYY'), 'DD.MM.YYYY'), 'DD.MM.YYYY') as flight_date,
+reporting_airline,
+tail_number,
+flight_number,
+origin,
+destination,
+to_char(crs_dep_time::time, 'HH:MI')  as crs_dep_time,
+to_char(dep_time::time, 'HH:MI')  as dep_time,
+dep_delay_minutes,
+cancelled,
+cancellation_code,
+air_time,
+distance,
+weather_delay
+from kdz_begeba_src.hnl_flights_fixed, kdz_begeba_etl.srctostag_comparets
+where loaded_ts > ts1 and loaded_ts <=ts2;
+
+###Weather:
+drop table if exists kdz_begeba_etl.srctostag_weathertemp;
+create table if not exists kdz_begeba_etl.srctostag_weathertemp as
+select distinct
+icao_code,
+to_date(local_time, 'MM.DD.YYYY HH24:MI:SS') as local_time,
+air_temperature,
+p0_station_pressure,
+p_sea_pressure,
+u_humidity,
+dd_wind_direction,
+ff_wind_speed,
+ff10_max_gust_speed,
+ww_present_phenomena,
+ww_recent_phenomena,
+c_total_cloud_cover,
+vv_horizontal_visibility,
+td_dewpoint_temperature
+from kdz_begeba_src.hnl_weather, kdz_begeba_etl.srctostag_comparets_weather
+where loaded_ts > ts1 and loaded_ts <=ts2;
+
+##4. Запись в целевую таблицу Staging
+###Flights:
+insert into kdz_begeba_staging.hnl_flights_staging( "year", quarter, "month", flight_date, reporting_airline, tail_number, flight_number, origin, destination, crs_dep_time, dep_time, dep_delay_minutes, cancelled, cancellation_code, air_time, distance, weather_delay)
+select "year", quarter, "month", flight_date, reporting_airline, tail_number, flight_number, origin, destination, crs_dep_time, dep_time, dep_delay_minutes, cancelled, cancellation_code, air_time, distance, weather_delay
+from kdz_begeba_etl.srctostag_flightstemp
+on conflict(flight_date, flight_number, origin, destination, crs_dep_time) do update
+set "year" = excluded."year",
+quarter = excluded.quarter,
+"month" = excluded."month",
+reporting_airline = excluded.reporting_airline,
+tail_number = excluded.tail_number,
+dep_time = excluded.dep_time,
+dep_delay_minutes = excluded.dep_delay_minutes,
+cancelled = excluded.cancelled,
+cancellation_code = excluded.cancellation_code,
+air_time = excluded.air_time,
+distance = excluded.distance,
+weather_delay = excluded.weather_delay,
+loaded_ts = now()
+;
+
+###Weather:
+insert into kdz_begeba_staging.hnl_weather_staging( icao_code, local_time, air_temperature, p0_station_pressure, p_sea_pressure, u_humidity, dd_wind_direction, ff_wind_speed, ff10_max_gust_speed, ww_present_phenomena, ww_recent_phenomena, c_total_cloud_cover, vv_horizontal_visibility, td_dewpoint_temperature)
+select icao_code, local_time, air_temperature, p0_station_pressure, p_sea_pressure, u_humidity, dd_wind_direction, ff_wind_speed, ff10_max_gust_speed, ww_present_phenomena, ww_recent_phenomena, c_total_cloud_cover, vv_horizontal_visibility, td_dewpoint_temperature
+from kdz_begeba_etl.weathertemp
+on conflict(local_time) do update
+set air_temperature = excluded.air_temperature,
+icao_code = excluded.icao_code,
+p0_station_pressure = excluded.p0_station_pressure,
+p_sea_pressure = excluded.p_sea_pressure,
+u_humidity = excluded.u_humidity,
+dd_wind_direction = excluded.dd_wind_direction,
+ff_wind_speed = excluded.ff_wind_speed,
+ff10_max_gust_speed = excluded.ff10_max_gust_speed,
+ww_present_phenomena = excluded.ww_present_phenomena,
+ww_recent_phenomena = excluded.ww_recent_phenomena,
+c_total_cloud_cover = excluded.c_total_cloud_cover,
+vv_horizontal_visibility = excluded.vv_horizontal_visibility,
+td_dewpoint_temperature = excluded.td_dewpoint_temperature,
+loaded_ts = now()
+;
