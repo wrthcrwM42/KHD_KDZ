@@ -1,7 +1,8 @@
-#Код для подключения к базе и установки сертификата:
+#Код для подключения к базе, установки сертификата и переноса сырых данных в таблицу:
 
 /psql "host= c-c9qia8aq371ibav26ned.rw.mdb.yandexcloud.net port=6432 sslmode=verify-full dbname=hse_main user=sa target_session_attrs=read-write"
 mkdir -p ~/.postgresql && \ wget "https://storage.yandexcloud.net/cloudcerts/CA.pem" \ --output-document ~/.postgresql/root.crt && \ chmod 0600 ~/.postgresql/root.crt
+\copy kdz_begeba_src.hnl_flights("year", quarter, "month", flight_date, reporting_airline, tail_number, flight_number, origin, destination, crs_dep_time, dep_time, dep_delay_minutes, cancelled, cancellation_code, air_time, distance, weather_delay) from 'D:\DWH_Test\January.csv' with delimiter ',' CSV HEADER;
 
 #Код для etl-процедур src-to-staging
 
@@ -233,34 +234,6 @@ reporting_airline,
 tail_number,
 flight_number,
 origin,
-as origin_dk,
-destination,
-as destination_dk
-crs_dep_time,
-dep_time,
-dep_delay_minutes,
-cancelled,
-cancellation_code,
-air_time,
-distance,
-weather_delay
-from kdz_begeba_staging.hnl_flights_staging
-WHERE origin = 'HNL' AND cancelled = '1.00' or origin = 'HNL' and dep_delay_minutes > 0;
-
-drop table if exists kdz_begeba_etl.flights_hnl_ready;
-create table kdz_begeba_etl.flights_hnl_cancelled_ready as
-select distinct
-"year",
-quarter,
-"month",
-to_timestamp(concat(to_char(flight_date, 'MM.DD.YY'), ' ', crs_dep_time), 'MM.DD.YY HH.MI') as flight_dep_scheduled,
-flight_date as flight_scheduled_date,
-to_timestamp(concat(to_char(flight_date, 'MM.DD.YY'), ' ', crs_dep_time), 'MM.DD.YY HH:MI') + dep_delay_minutes * INTERVAL '1 minute' as flight_dep_actual,
-to_date(to_char(to_timestamp(concat(to_char(flight_date, 'MM.DD.YY'), ' ', crs_dep_time), 'MM.DD.YY HH:MI') + dep_delay_minutes * INTERVAL '1 minute', 'MM.DD.YY'), 'MM.DD.YY') as flight_actual_date,
-reporting_airline,
-tail_number,
-flight_number,
-origin,
 (select airport_dk 
 from dds.airport 
 WHERE iata_code = origin) as origin_dk,
@@ -278,3 +251,28 @@ distance,
 weather_delay
 from kdz_begeba_staging.hnl_flights_staging
 WHERE origin = 'HNL' AND cancelled = '1.00' or origin = 'HNL' and dep_delay_minutes > 0;
+
+#Перенос данных в целевую таюлицу dds
+##Flights:
+insert into kdz_begeba_dds.hnl_flights_dds( "year", quarter, "month", flight_dep_scheduled, flight_scheduled_date, flight_dep_actual, flight_actual_date, reporting_airline, tail_number, flight_number, origin, origin_dk, destination, destination_dk, dep_delay_minutes, cancelled, cancellation_code, air_time, distance, weather_delay)
+select "year", quarter, "month", flight_dep_scheduled, flight_scheduled_date, flight_dep_actual, flight_actual_date, reporting_airline, tail_number, flight_number, origin, origin_dk, destination, destination_dk, dep_delay_minutes, cancelled, cancellation_code, air_time, distance, weather_delay
+from kdz_begeba_etl.flights_hnl_cancelled_ready
+on conflict(flight_dep_scheduled, reporting_airline, flight_number, origin, destination) do update
+set "year" = excluded."year",
+quarter = excluded.quarter,
+"month" = excluded."month",
+flight_scheduled_date = excluded.flight_scheduled_date,
+flight_dep_actual = excluded.flight_dep_actual,
+flight_actual_date = excluded.flight_actual_date,
+tail_number = excluded.tail_number,
+flight_number = excluded.flight_number,
+origin_dk = excluded.origin_dk,
+destination_dk = excluded.destination_dk,
+dep_delay_minutes = excluded.dep_delay_minutes,
+cancelled = excluded.cancelled,
+cancellation_code = excluded.cancellation_code,
+air_time = excluded.air_time,
+distance = excluded.distance,
+weather_delay = excluded.weather_delay,
+loaded_ts = now()
+;
